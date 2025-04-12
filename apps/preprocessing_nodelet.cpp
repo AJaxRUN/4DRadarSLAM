@@ -76,6 +76,15 @@ public:
     pc2_raw_pub = nh.advertise<sensor_msgs::PointCloud2>("/eagle_data/pc2_raw",1);
     enable_dynamic_object_removal = private_nh.param<bool>("enable_dynamic_object_removal", false);
     power_threshold = private_nh.param<float>("power_threshold", 0);
+
+    // Initialize smoke detection parameters
+    smoke_detection_window = private_nh.param<int>("smoke_detection_window", 10);  // Number of frames to consider
+    point_density_threshold = private_nh.param<double>("point_density_threshold", 100.0);  // Points per cubic meter
+    noise_threshold = private_nh.param<double>("noise_threshold", 0.1);  // Threshold for noise detection
+    radar_weight_smoke = private_nh.param<double>("radar_weight_smoke", 0.8);
+    lidar_weight_smoke = private_nh.param<double>("lidar_weight_smoke", 0.2);
+    radar_weight_normal = private_nh.param<double>("radar_weight_normal", 0.3);
+    lidar_weight_normal = private_nh.param<double>("lidar_weight_normal", 0.7);
   }
 
 private:
@@ -368,24 +377,38 @@ private:
     }
 
     pcl::PointCloud<PointT>::ConstPtr filtered = distance_filter(src_cloud);
-    // filtered = passthrough(filtered);
     filtered = downsample(filtered);
     filtered = outlier_removal(filtered);
 
-    // Distance Histogram
-    static size_t num_frame = 0;
-    if (num_frame % 10 == 0) {
-      Eigen::VectorXi num_at_dist = Eigen::VectorXi::Zero(100);
-      for (int i = 0; i < filtered->size(); i++){
-        int dist = floor(filtered->at(i).getVector3fMap().norm());
-        if (dist < 100)
-          num_at_dist(dist) += 1;
-      }
-      num_at_dist_vec.push_back(num_at_dist);
+    // Detect smoke in the current point cloud
+    bool smoke_detected = detect_smoke(filtered);
+
+    // Apply adaptive weights based on smoke detection
+    double radar_weight = smoke_detected ? radar_weight_smoke : radar_weight_normal;
+    double lidar_weight = smoke_detected ? lidar_weight_smoke : lidar_weight_normal;
+
+    // Apply weights to point intensities
+    pcl::PointCloud<PointT>::Ptr weighted_cloud(new pcl::PointCloud<PointT>);
+    weighted_cloud->header = filtered->header;
+    weighted_cloud->points.reserve(filtered->points.size());
+
+    for (const auto& point : filtered->points) {
+      PointT weighted_point = point;
+      weighted_point.intensity *= (point.intensity > power_threshold) ? radar_weight : lidar_weight;
+      weighted_cloud->points.push_back(weighted_point);
     }
 
-    points_pub.publish(*filtered);
-    
+    // Publish the weighted point cloud
+    points_pub.publish(*weighted_cloud);
+
+    // Log smoke detection status periodically
+    static ros::Time last_log_time = ros::Time::now();
+    if ((ros::Time::now() - last_log_time).toSec() > 1.0) {
+      ROS_INFO("Smoke detection status: %s (Radar weight: %.2f, Lidar weight: %.2f)",
+               smoke_detected ? "Smoke detected" : "No smoke",
+               radar_weight, lidar_weight);
+      last_log_time = ros::Time::now();
+    }
   }
 
 
@@ -573,6 +596,53 @@ private:
     }
   }
 
+  bool detect_smoke(const pcl::PointCloud<PointT>::ConstPtr& cloud) {
+    if (cloud->empty()) return false;
+
+    // Calculate point density
+    double volume = 0.0;
+    double min_x = std::numeric_limits<double>::max();
+    double max_x = std::numeric_limits<double>::lowest();
+    double min_y = std::numeric_limits<double>::max();
+    double max_y = std::numeric_limits<double>::lowest();
+    double min_z = std::numeric_limits<double>::max();
+    double max_z = std::numeric_limits<double>::lowest();
+
+    for (const auto& point : cloud->points) {
+      min_x = std::min(min_x, static_cast<double>(point.x));
+      max_x = std::max(max_x, static_cast<double>(point.x));
+      min_y = std::min(min_y, static_cast<double>(point.y));
+      max_y = std::max(max_y, static_cast<double>(point.y));
+      min_z = std::min(min_z, static_cast<double>(point.z));
+      max_z = std::max(max_z, static_cast<double>(point.z));
+    }
+
+    volume = (max_x - min_x) * (max_y - min_y) * (max_z - min_z);
+    double point_density = cloud->size() / volume;
+
+    // Calculate noise level using statistical outlier removal
+    pcl::StatisticalOutlierRemoval<PointT> sor;
+    sor.setInputCloud(cloud);
+    sor.setMeanK(50);
+    sor.setStddevMulThresh(1.0);
+    pcl::PointCloud<PointT>::Ptr cloud_filtered(new pcl::PointCloud<PointT>);
+    sor.filter(*cloud_filtered);
+    double noise_ratio = 1.0 - (static_cast<double>(cloud_filtered->size()) / cloud->size());
+
+    // Detect smoke based on point density and noise level
+    bool smoke_detected = (point_density < point_density_threshold) || (noise_ratio > noise_threshold);
+
+    // Update smoke detection history
+    smoke_detection_history.push_back(smoke_detected);
+    if (smoke_detection_history.size() > smoke_detection_window) {
+      smoke_detection_history.pop_front();
+    }
+
+    // Determine final smoke status based on history
+    int smoke_count = std::count(smoke_detection_history.begin(), smoke_detection_history.end(), true);
+    return (static_cast<double>(smoke_count) / smoke_detection_history.size()) > 0.5;
+  }
+
 private:
   ros::NodeHandle nh;
   ros::NodeHandle private_nh;
@@ -615,6 +685,16 @@ private:
   std::vector<double> egovel_time;
 
   std::vector<Eigen::VectorXi> num_at_dist_vec;
+
+  // Smoke detection parameters
+  int smoke_detection_window;
+  double point_density_threshold;
+  double noise_threshold;
+  double radar_weight_smoke;
+  double lidar_weight_smoke;
+  double radar_weight_normal;
+  double lidar_weight_normal;
+  std::deque<bool> smoke_detection_history;
 };
 
 }  // namespace radar_graph_slam

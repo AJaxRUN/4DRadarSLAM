@@ -56,4 +56,12 @@ radar_slam:
   #                 0, 1, 0,
   #                 0, 0, 1]
 
+  smoke_detection_window: 10        # Number of frames to consider for stable detection
+  point_density_threshold: 100.0    # Points per cubic meter threshold
+  noise_threshold: 0.1             # Threshold for noise detection
+  radar_weight_smoke: 0.8          # Radar weight when smoke is detected
+  lidar_weight_smoke: 0.2          # LIDAR weight when smoke is detected
+  radar_weight_normal: 0.3         # Radar weight under normal conditions
+  lidar_weight_normal: 0.7         # LIDAR weight under normal conditions
+
 
